@@ -2,10 +2,10 @@
 {% block content %}
 
 <section class="stats">
-  <div class="stat"><span>{{ stats.records }}</span><label>记录</label></div>
+  <div class="stat"><span>{{ stats.records }}</span><label>启用记录</label></div>
+  <div class="stat"><span>{{ stats.disabled }}</span><label>停用记录</label></div>
   <div class="stat"><span>{{ stats.groups }}</span><label>当前分组</label></div>
-  <div class="stat"><span>{{ stats.same }}</span><label>同一人判定</label></div>
-  <div class="stat"><span>{{ stats.different }}</span><label>不同人判定</label></div>
+  <div class="stat"><span>{{ stats.same }} / {{ stats.different }}</span><label>同一人 / 不同人判定</label></div>
 </section>
 
 <div class="grid">
@@ -19,10 +19,12 @@
       必需列：<code>record_id</code>（唯一记录ID）、<code>source</code>（来源）、<code>name</code>（姓名）、
       <code>org</code>（单位）。也接受中文表头：唯一记录ID / 来源 / 姓名 / 单位。
       按 <code>record_id</code> 幂等导入：同 ID 再次导入会更新姓名与单位。
+      普通导入不会恢复停用记录；若某 ID 已停用或属于其他来源，整批拒绝。
     </p>
     <p class="hint">
       <a href="{{ url_for('sample_csv') }}">下载示例 CSV</a>
-      · 示例包含 7 条跨系统记录，覆盖同名不同人、跨库同一人、以及已被判为不同人的情况。
+      · 示例包含 10 条跨系统记录，覆盖同名不同人、跨库同一人、以及已被判为不同人的情况。
+      · 需要按来源整体同步时请使用 <a href="{{ url_for('refresh_form') }}">整源刷新</a>。
     </p>
   </section>
 
@@ -34,7 +36,7 @@
         <label>记录 A
           <select name="a" id="sel-a" required>
             <option value="">选择记录…</option>
-            {% for r in records %}
+            {% for r in enabled_records %}
               <option value="{{ r.record_id }}" {{ 'selected' if sel_a == r.record_id }}>
                 {{ r.record_id }} · {{ r.name }} · {{ r.org }} · {{ r.source }}
               </option>
@@ -44,7 +46,7 @@
         <label>记录 B
           <select name="b" id="sel-b" required>
             <option value="">选择记录…</option>
-            {% for r in records %}
+            {% for r in enabled_records %}
               <option value="{{ r.record_id }}" {{ 'selected' if sel_b == r.record_id }}>
                 {{ r.record_id }} · {{ r.name }} · {{ r.org }} · {{ r.source }}
               </option>
@@ -57,7 +59,10 @@
         <button class="btn diff" type="submit" name="kind" value="different">判定为不同人</button>
       </div>
     </form>
-    <p class="hint">同一人关系自动传递；即使两条记录已在同组，直接判定仍会保存。不同人不得直接或间接同组，冲突会被拒绝并指出冲突记录对。</p>
+    <p class="hint">
+      同一人关系自动传递；即使两条记录已在同组，直接判定仍会保存。不同人不得直接或间接同组，冲突会被拒绝并指出冲突记录对。
+      停用记录不出现在此处，也不能新增判定；其原有判定仍可在下方查看与撤回。
+    </p>
   </section>
 </div>
 
@@ -71,18 +76,32 @@
     </form>
   </div>
   {% if records %}
+  <div class="table-wrap">
   <table class="records">
     <thead>
-      <tr><th>选择</th><th>唯一记录ID</th><th>来源</th><th>姓名</th><th>单位</th><th>当前分组</th></tr>
+      <tr><th>选择</th><th>唯一记录ID</th><th>来源</th><th>姓名</th><th>单位</th><th>状态</th><th>当前分组</th></tr>
     </thead>
     <tbody>
       {% for r in records %}
-      <tr>
-        <td><input type="checkbox" class="pick" value="{{ r.record_id }}"></td>
+      <tr class="{{ 'is-disabled' if not r.enabled else '' }}">
+        <td>
+          {% if r.enabled %}
+            <input type="checkbox" class="pick" value="{{ r.record_id }}">
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+        </td>
         <td><code>{{ r.record_id }}</code></td>
         <td><span class="tag">{{ r.source }}</span></td>
         <td>{{ r.name }}</td>
         <td>{{ r.org }}</td>
+        <td>
+          {% if r.enabled %}
+            <span class="chip enabled">启用</span>
+          {% else %}
+            <span class="chip disabled">已停用</span>
+          {% endif %}
+        </td>
         <td>
           {% if group_of.get(r.record_id) %}
             <a href="#group-{{ group_of[r.record_id] }}" class="group-link">{{ group_of[r.record_id] }}</a>
@@ -92,7 +111,8 @@
       {% endfor %}
     </tbody>
   </table>
-  <p class="hint">勾选两条记录可快速填入上方判定表单。</p>
+  </div>
+  <p class="hint">勾选两条启用记录可快速填入上方判定表单；停用记录不参与分组与映射下载。</p>
   {% else %}
   <p class="empty">暂无记录。请先导入 CSV（可先<a href="{{ url_for('sample_csv') }}">下载示例</a>）。</p>
   {% endif %}
@@ -165,6 +185,40 @@
   </table>
   {% else %}
   <p class="empty">尚无判定。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <h2>6. 停用记录的判定</h2>
+    <span class="hint">记录已停用，其判定暂不参与分组；记录恢复后会自动重新生效。可在此撤回</span>
+  </div>
+  {% if dormant_verdicts %}
+  <table class="verdicts">
+    <thead><tr><th>#</th><th>类型</th><th>记录 A</th><th>记录 B</th><th>停用方</th><th>时间</th><th></th></tr></thead>
+    <tbody>
+      {% for v in dormant_verdicts %}
+      <tr>
+        <td>{{ v.id }}</td>
+        <td><span class="chip {{ v.kind }}">{{ '同一人' if v.kind == 'same' else '不同人' }}</span></td>
+        <td><code>{{ v.a }}</code>{% if v.a in disabled_ids %} <span class="chip disabled">停用</span>{% endif %}</td>
+        <td><code>{{ v.b }}</code>{% if v.b in disabled_ids %} <span class="chip disabled">停用</span>{% endif %}</td>
+        <td>
+          {% for rid in [v.a, v.b] if rid in disabled_ids %}<code>{{ rid }}</code>{% if not loop.last %}、{% endif %}{% endfor %}
+        </td>
+        <td class="muted">{{ v.created_at }} UTC</td>
+        <td>
+          <form action="{{ url_for('revoke', verdict_id=v.id) }}" method="post" onsubmit="return confirm('确认撤回判定 #{{ v.id }}？');">
+            <input type="hidden" name="back" value="{{ request.full_path }}">
+            <button class="btn small ghost" type="submit">撤回</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">没有因记录停用而暂不生效的判定。</p>
   {% endif %}
 </section>
 

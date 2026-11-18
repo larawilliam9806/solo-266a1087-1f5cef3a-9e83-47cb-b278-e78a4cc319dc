@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}整源刷新 · 作者身份归并{% endblock %}
+{% block content %}
+
+<section class="card">
+  <h2>整源刷新</h2>
+  <p class="hint">
+    按来源同步完整作者名册：上传该来源的<strong>完整</strong> CSV（沿用四列格式）。预览会列出将新增、更新、
+    恢复、停用的记录；确认后一次性生效。源系统已删除的记录会被<strong>停用</strong>（保留原记录与判定），
+    不会影响其他来源的记录。仅含表头的 CSV 会清空该来源（全部停用）。
+  </p>
+  <form action="{{ url_for('refresh_preview') }}" method="post" enctype="multipart/form-data" class="import-form">
+    <label class="inline-field">来源
+      <input type="text" name="source" list="source-list" value="{{ selected_source }}"
+             placeholder="选择已有来源或输入新来源" required>
+    </label>
+    <datalist id="source-list">
+      {% for s in sources %}<option value="{{ s }}">{% endfor %}
+    </datalist>
+    <input type="file" name="file" accept=".csv,text/csv" required>
+    <button class="btn primary" type="submit">上传并预览</button>
+  </form>
+  <p class="hint">
+    整批拒绝条件：文件内重复 ID、ID 已被其他来源占用、任意行来源与所选来源不一致、或缺少必需列。
+    已有记录默认启用；记录重现时会恢复其原有未撤回判定。
+  </p>
+</section>
+
+{% if preview %}
+{% set plan = preview.plan %}
+{% set counts = preview.counts %}
+<section class="card preview-card">
+  <div class="card-head">
+    <h2>预览：来源 <code>{{ preview.source }}</code></h2>
+    <span class="badge">尚未写入</span>
+  </div>
+
+  {% if preview.conflicts %}
+  <div class="warn">
+    <strong>注意：</strong>本次刷新会恢复以下记录，使其未撤回判定重新参与分组；这可能使已判定为
+    “不同人”的记录对进入同一分组，确认时将被拒绝并保留刷新前状态：
+    {% for a, b in preview.conflicts %}<code>{{ a }}</code> ↔ <code>{{ b }}</code>{% if not loop.last %}，{% endif %}{% endfor %}
+  </div>
+  {% endif %}
+
+  <div class="preview-counts">
+    <span class="pill">新增 <strong>{{ counts.inserted }}</strong></span>
+    <span class="pill">更新 <strong>{{ counts.updated }}</strong></span>
+    <span class="pill">恢复 <strong>{{ counts.reactivated }}</strong></span>
+    <span class="pill">停用 <strong>{{ counts.deactivated }}</strong></span>
+    <span class="pill">未变化 <strong>{{ counts.unchanged }}</strong></span>
+  </div>
+
+  {% if plan.inserts %}
+  <h3 class="section-title">将新增（{{ plan.inserts|length }}）</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>唯一记录ID</th><th>姓名</th><th>单位</th></tr></thead>
+    <tbody>
+      {% for r in plan.inserts %}<tr><td><code>{{ r.record_id }}</code></td><td>{{ r.name }}</td><td>{{ r.org }}</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+
+  {% if plan.updates %}
+  <h3 class="section-title">将更新 / 恢复（{{ plan.updates|length }}）</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>唯一记录ID</th><th>操作</th><th>姓名（原 → 新）</th><th>单位（原 → 新）</th></tr></thead>
+    <tbody>
+      {% for r in plan.updates %}
+      <tr>
+        <td><code>{{ r.record_id }}</code></td>
+        <td>
+          {% if r.action == 'reactivate' %}<span class="chip enabled">恢复</span>
+          {% else %}<span class="chip">更新</span>{% endif %}
+        </td>
+        <td>{{ r.before.name }} → {{ r.name }}</td>
+        <td>{{ r.before.org }} → {{ r.org }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+
+  {% if plan.deactivates %}
+  <h3 class="section-title">将停用（{{ plan.deactivates|length }}）</h3>
+  <p class="hint">以下记录不在本次完整名册中；停用后保留记录与判定，不参与分组且不出现在映射下载中。</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>唯一记录ID</th><th>姓名</th><th>单位</th></tr></thead>
+    <tbody>
+      {% for r in plan.deactivates %}<tr><td><code>{{ r.record_id }}</code></td><td>{{ r.name }}</td><td>{{ r.org }}</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+
+  {% if not plan.inserts and not plan.updates and not plan.deactivates %}
+  <p class="empty">名册与现有记录完全一致，确认后不会有任何变化。</p>
+  {% endif %}
+
+  <form action="{{ url_for('refresh_confirm') }}" method="post" class="confirm-form">
+    <input type="hidden" name="preview_id" value="{{ preview.preview_id }}">
+    <button class="btn primary" type="submit">确认刷新</button>
+    <a class="btn ghost" href="{{ url_for('refresh_form') }}">取消</a>
+  </form>
+  <p class="hint">确认前若记录或判定发生变化，本次预览会失效，需要重新上传预览。</p>
+</section>
+{% endif %}
+
+<section class="card">
+  <div class="card-head">
+    <h2>当前停用记录</h2>
+    <span class="hint">停用记录保留原数据与判定；仅当完整名册再次包含该 ID 时才会恢复</span>
+  </div>
+  {% if disabled_records %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>唯一记录ID</th><th>来源</th><th>姓名</th><th>单位</th></tr></thead>
+    <tbody>
+      {% for r in disabled_records %}
+      <tr><td><code>{{ r.record_id }}</code></td><td><span class="tag">{{ r.source }}</span></td><td>{{ r.name }}</td><td>{{ r.org }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <p class="empty">没有停用记录。</p>
+  {% endif %}
+</section>
+
+{% endblock %}

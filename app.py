@@ -47,25 +47,23 @@ def inject_globals():
 @app.get("/")
 def index():
     search = (request.args.get("q") or "").strip()
-    records = db.list_records(search)
-    groups = db.group_summary()
-    verdicts = db.list_verdicts()
-    group_of = {r.record_id: g["group_key"] for g in groups for r in g["records"]}
+    view = db.snapshot(search)
     return render_template(
         "index.html",
-        records=records,
-        groups=groups,
-        verdicts=verdicts,
-        group_of=group_of,
+        records=view["records"],
+        all_records=view["all_records"],
+        enabled_records=view["enabled_records"],
+        disabled_records=view["disabled_records"],
+        disabled_ids=view["disabled_ids"],
+        groups=view["groups"],
+        verdicts=view["verdicts"],
+        dormant_verdicts=view["dormant_verdicts"],
+        dormant_by_record=view["dormant_by_record"],
+        group_of=view["group_of"],
         search=search,
         sel_a=request.args.get("a", ""),
         sel_b=request.args.get("b", ""),
-        stats={
-            "records": len(group_of),
-            "groups": len(groups),
-            "same": sum(1 for v in verdicts if v.kind == "same"),
-            "different": sum(1 for v in verdicts if v.kind == "different"),
-        },
+        stats=view["stats"],
     )
 
 
@@ -172,6 +170,26 @@ def _parse_csv(text: str) -> tuple[list[db.Record], list[str]]:
     return records, errors
 
 
+def _read_upload() -> tuple[str | None, str | None, str | None]:
+    """Return (text, filename, error) for the uploaded CSV."""
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return None, None, "请选择要上传的 CSV 文件。"
+    raw = upload.read()
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return raw.decode(encoding), upload.filename, None
+        except UnicodeDecodeError:
+            continue
+    return None, None, "无法识别文件编码，请使用 UTF-8（可带 BOM）或 GB18030 保存 CSV。"
+
+
+def _format_errors(errors: list[str]) -> str:
+    shown = "；".join(errors[:5])
+    more = f"（另有 {len(errors) - 5} 处错误）" if len(errors) > 5 else ""
+    return shown + more
+
+
 @app.get("/import")
 def import_form():
     return redirect(url_for("index"))
@@ -179,36 +197,115 @@ def import_form():
 
 @app.post("/import")
 def import_csv():
-    upload = request.files.get("file")
-    if upload is None or not upload.filename:
-        flash("请选择要导入的 CSV 文件。", "error")
-        return redirect(url_for("index"))
-
-    raw = upload.read()
-    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
-        try:
-            text = raw.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        flash("无法识别文件编码，请使用 UTF-8（可带 BOM）或 GB18030 保存 CSV。", "error")
+    text, filename, error = _read_upload()
+    if error:
+        flash(error, "error")
         return redirect(url_for("index"))
 
     records, errors = _parse_csv(text)
     if errors:
-        preview = "；".join(errors[:5])
-        more = f"（另有 {len(errors) - 5} 处错误）" if len(errors) > 5 else ""
-        flash(f"导入失败，未写入任何记录：{preview}{more}", "error")
+        flash(f"导入失败，未写入任何记录：{_format_errors(errors)}", "error")
         return redirect(url_for("index"))
     if not records:
         flash("CSV 中没有可导入的数据行。", "error")
         return redirect(url_for("index"))
 
-    result = db.import_records(records, filename=upload.filename)
+    try:
+        result = db.import_records(records, filename=filename)
+    except db.ValidationError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("index"))
+
     flash(
         f"导入完成：新增 {result['inserted']} 条，更新 {result['updated']} 条，"
         f"文件内重复记录 {result['skipped_duplicates']} 条（以最后一行为准）。",
+        "success",
+    )
+    return redirect(url_for("index"))
+
+
+@app.get("/refresh")
+def refresh_form():
+    view = db.snapshot()
+    return render_template(
+        "refresh.html",
+        sources=db.list_sources(),
+        enabled_records=view["enabled_records"],
+        disabled_records=view["disabled_records"],
+        preview=None,
+        selected_source=(request.args.get("source") or "").strip(),
+    )
+
+
+@app.post("/refresh/preview")
+def refresh_preview():
+    text, filename, error = _read_upload()
+    if error:
+        flash(error, "error")
+        return redirect(url_for("refresh_form"))
+
+    source = (request.form.get("source") or "").strip()
+    if not source:
+        flash("请选择或填写要刷新的来源。", "error")
+        return redirect(url_for("refresh_form"))
+
+    records, errors = _parse_csv(text)
+    if errors:
+        flash(f"整源刷新被拒绝，未做任何修改：{_format_errors(errors)}", "error")
+        return redirect(url_for("refresh_form", source=source))
+
+    try:
+        preview = db.create_refresh_preview(source, records, filename=filename)
+    except db.ValidationError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("refresh_form", source=source))
+
+    view = db.snapshot()
+    return render_template(
+        "refresh.html",
+        sources=db.list_sources(),
+        enabled_records=view["enabled_records"],
+        disabled_records=view["disabled_records"],
+        preview=preview,
+        selected_source=source,
+    )
+
+
+@app.post("/refresh/confirm")
+def refresh_confirm():
+    preview_id = (request.form.get("preview_id") or "").strip()
+    try:
+        result = db.confirm_refresh(preview_id)
+    except db.NotFoundError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("refresh_form"))
+    except db.ValidationError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("refresh_form"))
+
+    if not result["ok"]:
+        if result["reason"] == "stale":
+            flash(
+                "预览已失效：预览之后记录或判定发生了变化，本次刷新未执行。"
+                "请确认最新数据后重新上传并预览。",
+                "warning",
+            )
+            return redirect(url_for("refresh_form", source=result.get("source", "")))
+        pairs = "；".join(f"{a} ↔ {b}" for a, b in result["conflict_pairs"])
+        flash(
+            f"整源刷新被拒绝，刷新前状态完全保留：恢复记录后会使以下已判定为“不同人”的"
+            f"记录对进入同一分组 [{pairs}]。"
+            f"请先撤回相关“同一人”判定（可在首页“停用记录的判定”中查看并撤回）后重新预览。",
+            "error",
+        )
+        return redirect(url_for("refresh_form", source=result.get("source", "")))
+
+    counts = result["counts"]
+    flash(
+        f"已刷新来源“{result['source']}”：新增 {counts['inserted']} 条，"
+        f"更新 {counts['updated']} 条，恢复 {counts['reactivated']} 条，"
+        f"停用 {counts['deactivated']} 条，未变化 {counts['unchanged']} 条。"
+        f"停用记录及其判定已保留，来源内其余记录未受影响。",
         "success",
     )
     return redirect(url_for("index"))
@@ -237,13 +334,15 @@ def export_csv():
 
 @app.get("/api/groups")
 def api_groups():
+    view = db.snapshot()
     return jsonify(
         {
             "groups": [
                 {"group_id": g["group_key"], "record_ids": [r.record_id for r in g["records"]]}
-                for g in db.group_summary()
+                for g in view["groups"]
             ],
             "mapping": dict(db.export_rows()),
+            "disabled_record_ids": sorted(view["disabled_ids"]),
         }
     )
 
